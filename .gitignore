@@ -3,4 +3,4 @@
 
 # Ignore specific directories
 source/
-extracted/
+reconstruct/
