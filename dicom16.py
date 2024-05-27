@@ -5,9 +5,9 @@ import time
 
 import numpy as np
 import pillow_avif  # Ensure AVIF support is added
-import rawpy
 from PIL import Image
 from pydicom import dcmread
+from pydicom.pixel_data_handlers.util import apply_voi_lut
 
 
 def extract_images_from_dicom(dicom_path, output_dir):
@@ -18,20 +18,24 @@ def extract_images_from_dicom(dicom_path, output_dir):
         
         # Ensure the output directory exists
         os.makedirs(output_dir, exist_ok=True)
+        
+        # Apply VOI LUT (if available)
+        pixel_array = apply_voi_lut(dicom_data.pixel_array, dicom_data)
+        
+        # Normalize pixel values to the range [0, 65535] if 16-bit
+        pixel_array = pixel_array - np.min(pixel_array)
+        pixel_array = (pixel_array / np.max(pixel_array)) * 65535.0
+        pixel_array = pixel_array.astype(np.uint16)
 
-        # Check if pixel data handler is present
-        if 'PixelData' not in dicom_data:
-            print(f"No pixel data found in {dicom_path}")
-            return None
-
-        # Get pixel data
-        pixel_array = dicom_data.pixel_array
-        print(f"Pixel array shape: {pixel_array.shape}, dtype: {pixel_array.dtype}")
-
-        # Loop through each frame in the DICOM file (if multi-frame)
-        for i, frame in enumerate(pixel_array):
-            output_image_path = os.path.join(output_dir, f'image_{i}.tif')
-            Image.fromarray(frame).save(output_image_path)
+        # Check if the DICOM is multi-frame
+        if len(pixel_array.shape) == 3:
+            for i, frame in enumerate(pixel_array):
+                output_image_path = os.path.join(output_dir, f'image_{i}.tif')
+                Image.fromarray(frame).save(output_image_path)
+                extracted_images.append(output_image_path)
+        else:
+            output_image_path = os.path.join(output_dir, 'image_0.tif')
+            Image.fromarray(pixel_array).save(output_image_path)
             extracted_images.append(output_image_path)
         
         return extracted_images
@@ -107,69 +111,68 @@ def reconstruct_image(high_bits_path, low_bits_path, output_path):
         print(f"An error occurred during reconstruction: {e}")
         return None
 
-def process_dng(image_path, output_dir):
-    try:
-        # Ensure the output directory exists
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Read the DNG file using rawpy
-        with rawpy.imread(image_path) as raw:
-            img_array = raw.postprocess(output_bps=16)
-
-        # Convert the image array to an Image object
-        img = Image.fromarray(img_array)
-
-        # Save the image as a 16-bit TIFF
-        tiff_image_path = os.path.join(output_dir, f'{os.path.basename(image_path).split(".")[0]}.tif')
-        img.save(tiff_image_path)
-
-        return tiff_image_path
-    except Exception as e:
-        print(f"An error occurred while processing DNG: {e}")
-        return None
-
 def main():
     source_dir = 'source'
     dicom_files = [f for f in os.listdir(source_dir) if f.lower().endswith('.dcm')]
-    dng_files = [f for f in os.listdir(source_dir) if f.lower().endswith('.dng')]
-    
-    if not dicom_files and not dng_files:
-        print("No DICOM or DNG files found in the source directory.")
+    if not dicom_files:
+        print("No DICOM files found in the source directory.")
         return
     
+    dicom_path = os.path.join(source_dir, dicom_files[0])
     output_dir = 'reconstruct'
     extracted_output_dir = os.path.join(output_dir, 'extracted')
     split_output_dir = os.path.join(output_dir, 'split')
     reconstructed_output_dir = os.path.join(output_dir, 'reconstructed')
 
+    # Extract images from DICOM file
+    extracted_images = extract_images_from_dicom(dicom_path, extracted_output_dir)
+    if extracted_images is None:
+        print("No images extracted. Exiting.")
+        return
+
     report_data = []
 
-    # Process DICOM files
-    for dicom_file in dicom_files:
-        dicom_path = os.path.join(source_dir, dicom_file)
+    for image_path in extracted_images:
+        # Get original image size
+        original_size = os.path.getsize(image_path)
+        start_time = time.time()
 
-        # Extract images from DICOM file
-        extracted_images = extract_images_from_dicom(dicom_path, extracted_output_dir)
-        if extracted_images is None:
-            print("No images extracted. Skipping.")
+        # Split and save image
+        high_bits_path, low_bits_path, metadata_path = split_and_save_image(image_path, split_output_dir)
+        if high_bits_path is None or low_bits_path is None:
+            print(f"Skipping image due to split error: {image_path}")
             continue
 
-        for image_path in extracted_images:
-            # Process each extracted image
-            process_image(image_path, split_output_dir, reconstructed_output_dir, report_data)
+        split_time = time.time() - start_time
+        combined_split_size = os.path.getsize(high_bits_path) + os.path.getsize(low_bits_path)
 
-    # Process DNG files
-    for dng_file in dng_files:
-        dng_path = os.path.join(source_dir, dng_file)
-
-        # Convert DNG to TIFF
-        tiff_image_path = process_dng(dng_path, extracted_output_dir)
-        if tiff_image_path is None:
-            print(f"Skipping DNG due to processing error: {dng_path}")
+        # Reconstruct image
+        start_time = time.time()
+        reconstructed_image_path = reconstruct_image(high_bits_path, low_bits_path, os.path.join(reconstructed_output_dir, f'reconstructed_{os.path.basename(image_path)}'))
+        if reconstructed_image_path is None:
+            print(f"Skipping image due to reconstruction error: {image_path}")
             continue
 
-        # Process the converted TIFF image
-        process_image(tiff_image_path, split_output_dir, reconstructed_output_dir, report_data)
+        reconstruct_time = time.time() - start_time
+        reconstructed_size = os.path.getsize(reconstructed_image_path)
+
+        # Calculate percentage reduction
+        if original_size > 0:
+            percentage_reduction = ((original_size - combined_split_size) / float(original_size)) * 100
+        else:
+            percentage_reduction = 0.0
+
+        print(f"Original size: {original_size}, Combined split size: {combined_split_size}, Percentage reduction: {percentage_reduction}")
+
+        report_data.append({
+            'original_image': image_path,
+            'original_size': original_size,
+            'split_time': split_time,
+            'combined_split_size': combined_split_size,
+            'reconstruct_time': reconstruct_time,
+            'reconstructed_size': reconstructed_size,
+            'percentage_reduction': percentage_reduction
+        })
 
     # Write report to CSV
     report_csv_path = os.path.join(output_dir, 'report.csv')
@@ -182,48 +185,6 @@ def main():
             writer.writerow(row)
 
     print(f"Report saved as: {report_csv_path}")
-
-def process_image(image_path, split_output_dir, reconstructed_output_dir, report_data):
-    # Get original image size
-    original_size = os.path.getsize(image_path)
-    start_time = time.time()
-
-    # Split and save image
-    high_bits_path, low_bits_path, metadata_path = split_and_save_image(image_path, split_output_dir)
-    if high_bits_path is None or low_bits_path is None:
-        print(f"Skipping image due to split error: {image_path}")
-        return
-
-    split_time = time.time() - start_time
-    combined_split_size = os.path.getsize(high_bits_path) + os.path.getsize(low_bits_path)
-
-    # Reconstruct image
-    start_time = time.time()
-    reconstructed_image_path = reconstruct_image(high_bits_path, low_bits_path, os.path.join(reconstructed_output_dir, f'reconstructed_{os.path.basename(image_path)}'))
-    if reconstructed_image_path is None:
-        print(f"Skipping image due to reconstruction error: {image_path}")
-        return
-
-    reconstruct_time = time.time() - start_time
-    reconstructed_size = os.path.getsize(reconstructed_image_path)
-
-    # Calculate percentage reduction
-    if original_size > 0:
-        percentage_reduction = ((original_size - reconstructed_size) / float(original_size)) * 100
-    else:
-        percentage_reduction = 0.0
-
-    print(f"Original size: {original_size}, Reconstructed size: {reconstructed_size}, Percentage reduction: {percentage_reduction}")
-
-    report_data.append({
-        'original_image': image_path,
-        'original_size': original_size,
-        'split_time': split_time,
-        'combined_split_size': combined_split_size,
-        'reconstruct_time': reconstruct_time,
-        'reconstructed_size': reconstructed_size,
-        'percentage_reduction': percentage_reduction
-    })
 
 if __name__ == '__main__':
     main()
