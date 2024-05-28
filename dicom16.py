@@ -5,6 +5,7 @@ import time
 
 import numpy as np
 import pillow_avif  # Ensure AVIF support is added
+import pydicom
 from PIL import Image
 from pydicom import dcmread
 from pydicom.pixel_data_handlers.util import apply_voi_lut

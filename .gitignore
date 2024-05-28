@@ -4,3 +4,4 @@
 # Ignore specific directories
 source/
 reconstruct/
+dicom_files/
