@@ -6,3 +6,6 @@ source/
 reconstruct/
 dicom_files/
 dicom_samples/
+backup/
+reconstruct-8-8/
+reconstruct-jp2/
